@@ -6,6 +6,9 @@
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
+#include <utime.h>
+#include <sys/stat.h>
+
 #include "pcre.h"
 #include "request.h"
 #include "ug_index.h"
@@ -15,7 +18,7 @@
 #define USAGE "Usage: ug_build_index process.lua file\n"
 
 // index file format
-// [64bit,64bit] -- timestamp, file offset 
+// [64bit,64bit] -- timestamp, file offset
 // [32bit, Nbytes] -- extra data
 
 static build_idx_context_t ctx;
@@ -29,6 +32,7 @@ void handle_request(request_t *req)
         ug_write_index(ctx.findex, floored_time, req->offset);
         ctx.last_index_time = floored_time;
     }
+    ctx.last_real_index_time = req->time;
 }
 
 void open_indexes(char *log_fname, char *index_path)
@@ -39,7 +43,7 @@ void open_indexes(char *log_fname, char *index_path)
 
     if (strcmp(log_fname + (strlen(log_fname) - 3), ".gz") == 0) {
         gz_index_fname = ug_get_index_fname(log_fname, "gzidx", index_path);
-        /* we don't do incremental index building in gzipped files -- we just truncate and 
+        /* we don't do incremental index building in gzipped files -- we just truncate and
          * build over*/
         ctx.findex = fopen(index_fname, "w+");
         ctx.fgzindex = fopen(gz_index_fname, "w+");
@@ -49,14 +53,7 @@ void open_indexes(char *log_fname, char *index_path)
             exit(1);
         }
     } else {
-        ctx.findex = fopen(index_fname, "r+");
-        if (ctx.findex) {
-            /* seek in the log, (and the index, with get_offset_for_timestamp()) to the 
-             * last timestamp we indexed */
-            fseeko(ctx.flog, ug_get_offset_for_timestamp(ctx.findex, -1), SEEK_SET);
-        } else {
-            ctx.findex = fopen(index_fname, "w+");
-        }
+        ctx.findex = fopen(index_fname, "w+");
         if (!ctx.findex) {
             fprintf(stderr, "Couldn't open index file '%s': %s\n", index_fname, strerror(errno));
             exit(1);
@@ -64,20 +61,15 @@ void open_indexes(char *log_fname, char *index_path)
     }
 }
 
-int main(int argc, char **argv)
+
+int build_index(char *lua_fname, char *log_fname, char *index_path)
 {
-    char *line = NULL, *lua_fname, *log_fname, *index_path;
+    char *line = NULL;
     ssize_t line_size;
     size_t allocated;
 
-    if (argc < 4) {
-        fprintf(stderr, USAGE);
-        exit(1);
-    }
-
-    lua_fname = argv[1];
-    log_fname = argv[2];
-    index_path = argv[3];
+    struct utimbuf times;
+    struct stat statbuf;
 
     bzero(&ctx, sizeof(build_idx_context_t));
 
@@ -88,6 +80,11 @@ int main(int argc, char **argv)
         perror("Couldn't open log file");
         exit(1);
     }
+
+    stat(log_fname, &statbuf);
+
+    times.actime = statbuf.st_atime;
+    times.modtime = statbuf.st_mtime;
 
     open_indexes(log_fname, index_path);
 
@@ -106,5 +103,17 @@ int main(int argc, char **argv)
         }
     }
     ug_lua_on_eof(ctx.lua);
-    exit(0);
+    ug_write_index(ctx.findex, ctx.last_real_index_time, -1);
+
+
+    fclose(ctx.flog);
+    fclose(ctx.findex);
+    if ( ctx.fgzindex ) {
+        fclose(ctx.fgzindex);
+    }
+
+    utime(ug_get_index_fname(log_fname, "idx", index_path), &times);
+    utime(ug_get_index_fname(log_fname, "gzidx", index_path), &times);
+
+    return 1;
 }

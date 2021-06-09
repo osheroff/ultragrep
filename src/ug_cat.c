@@ -4,9 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <libgen.h>
+#include <sys/stat.h>
 #include "ug_index.h"
 #include "ug_gzip.h"
 #include "zlib.h"
+
+
+int build_index(char *, char *, char *);
 
 /* target_offset is the offset in the uncompressed stream we're looking for. */
 void fill_gz_info(off_t target_offset, FILE * gz_index, unsigned char *dict_data, off_t * compressed_offset)
@@ -27,6 +31,7 @@ void fill_gz_info(off_t target_offset, FILE * gz_index, unsigned char *dict_data
         if (!fread(dict_data, WINSIZE, 1, gz_index))
             break;
     }
+
     return;
 }
 
@@ -37,7 +42,7 @@ void fill_gz_info(off_t target_offset, FILE * gz_index, unsigned char *dict_data
    should not return a data error unless the file was modified since the index
    was generated.  extract() may also return Z_ERRNO if there is an error on
    reading or seeking the input file. */
-int ug_gzip_cat(FILE * in, uint64_t time, FILE * offset_index, FILE * gz_index)
+void ug_gzip_cat(FILE * in, uint64_t time, FILE * offset_index, FILE * gz_index)
 {
     int ret, bits;
     off_t uncompressed_offset, compressed_offset;
@@ -57,6 +62,10 @@ int ug_gzip_cat(FILE * in, uint64_t time, FILE * offset_index, FILE * gz_index)
 
     if (gz_index && offset_index) {
         uncompressed_offset = ug_get_offset_for_timestamp(offset_index, time);
+
+        if ( uncompressed_offset == -1 )
+            return;
+
         fill_gz_info(uncompressed_offset, gz_index, dict, &compressed_offset);
 
         bits = compressed_offset >> 56;
@@ -64,17 +73,17 @@ int ug_gzip_cat(FILE * in, uint64_t time, FILE * offset_index, FILE * gz_index)
 
         ret = inflateInit2(&strm, -15);     /* raw inflate */
         if (ret != Z_OK)
-            return ret;
+            return;
 
         ret = fseeko(in, compressed_offset, SEEK_SET);
 
         if (ret != Z_OK)
-            return ret;
+            return;
     } else {
         compressed_offset = bits = 0;
         strm.avail_in = fread(input, 1, CHUNK, in);
         strm.next_in = input;
- 
+
         ret = inflateInit2(&strm, 47);
     }
 
@@ -129,14 +138,26 @@ int ug_gzip_cat(FILE * in, uint64_t time, FILE * offset_index, FILE * gz_index)
     /* clean up and return bytes read or error */
   extract_ret:
     (void) inflateEnd(&strm);
-    return ret;
+    return;
 }
-/* 
- * ug_cat -- given a log file and (possibly) a file + (timestamp -> offset) index, cat the file starting 
- *           from about that timestamp 
+/*
+ * ug_cat -- given a log file and (possibly) a file + (timestamp -> offset) index, cat the file starting
+ *           from about that timestamp
  */
 
-#define USAGE "Usage: ug_cat file timestamp index_path\n"
+#define USAGE "Usage: ug_cat timestamp index_path lua_file FILE [...FILE] \n"
+
+int need_index_rebuild(char * log_fname, char * index_fname) {
+    struct stat index_stat_buf, log_stat_buf;
+
+    if ( stat(index_fname, &index_stat_buf) == -1 )
+        return 1;
+
+    if ( stat(log_fname, &log_stat_buf) == -1 )
+        return 0; //shrug
+
+    return ( index_stat_buf.st_mtime != log_stat_buf.st_mtime );
+}
 
 int main(int argc, char **argv)
 {
@@ -145,44 +166,64 @@ int main(int argc, char **argv)
     FILE *index;
     char *log_fname, *index_fname, buf[4096];
 
-    if (argc < 4) {
+    if (argc < 5) {
         fprintf(stderr, USAGE);
         exit(1);
     }
 
-    log_fname = argv[1];
+    long ts = atol(argv[1]);
+    char *index_path = argv[2];
+    char *lua = argv[3];
 
-    log = fopen(log_fname, "r");
-    if (!log) {
-        perror("Couldn't open log file");
-        exit(1);
-    }
+    for(int i = 4; i < argc; i++ ) {
+        log_fname = argv[i];
 
-    index_fname = ug_get_index_fname(log_fname, "idx", argv[3]);
-
-    index = fopen(index_fname, "r");
-    if (strcmp(log_fname + (strlen(log_fname) - 3), ".gz") == 0) {
-        char *gzidx_fname;
-        FILE *gzidx;
-
-        if (index) {
-            gzidx_fname = ug_get_index_fname(log_fname, "gzidx", argv[3]);
-            gzidx = fopen(gzidx_fname, "r");
-            if (!gzidx) {
-                perror("error opening gzidx component");
-                exit(1);
-            }
-            ug_gzip_cat(log, atol(argv[2]), index, gzidx);
-
-        } else {
-            ug_gzip_cat(log, atol(argv[2]), NULL, NULL);
-
+        log = fopen(log_fname, "r");
+        if (!log) {
+            perror("Couldn't open log file");
+            exit(1);
         }
-    } else {
-        if (index)
-            fseeko(log, ug_get_offset_for_timestamp(index, atol(argv[2])), SEEK_SET);
 
-        while ((nread = fread(buf, 1, 4096, log)))
-            fwrite(buf, 1, nread, stdout);
+        printf("@@FILE:%s\n", log_fname);
+        index_fname = ug_get_index_fname(log_fname, "idx", index_path);
+
+        if ( need_index_rebuild(log_fname, index_fname) )
+            build_index(lua, log_fname, index_path);
+
+        index = fopen(index_fname, "r");
+        if (strcmp(log_fname + (strlen(log_fname) - 3), ".gz") == 0) {
+            char *gzidx_fname;
+            FILE *gzidx;
+
+            if (index) {
+                gzidx_fname = ug_get_index_fname(log_fname, "gzidx", index_path);
+                gzidx = fopen(gzidx_fname, "r");
+                if (!gzidx) {
+                    perror("error opening gzidx component");
+                    exit(1);
+                }
+                ug_gzip_cat(log, ts, index, gzidx);
+
+            } else {
+                ug_gzip_cat(log, ts, NULL, NULL);
+
+            }
+        } else {
+            if (index) {
+                long offset = ug_get_offset_for_timestamp(index, ts) ;
+                if ( offset == -1 ) {
+                    goto out;
+                }
+
+                fseeko(log, offset, SEEK_SET);
+            }
+
+            while ((nread = fread(buf, 1, 4096, log)))
+                fwrite(buf, 1, nread, stdout);
+        }
+    out:
+        fclose(log);
+        if ( index )
+            fclose(index);
     }
 }
