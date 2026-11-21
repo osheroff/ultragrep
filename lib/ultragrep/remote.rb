@@ -13,7 +13,7 @@ module Ultragrep
     end
 
     def lua
-      "~/.ultragrep_remote/#{@config.lua}"
+      "~/.ultragrep_remote/#{File.basename(@config.lua)}"
     end
 
     def popen(host, cat_cmd, filter)

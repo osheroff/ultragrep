@@ -40,13 +40,7 @@ module Ultragrep
     end
 
     def local_lua_path
-      return nil unless lua
-
-      if lua.include?('/')
-        return lua
-      else
-        return File.join(File.dirname(__FILE__), "..", "..", "lua", lua)
-      end
+      lua
     end
 
     def parse!
