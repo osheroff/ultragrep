@@ -1,5 +1,7 @@
 require 'open3'
+require 'fileutils'
 require 'ultragrep/executor'
+require 'tmpdir'
 
 module Ultragrep
   class Remote < Executor
@@ -49,18 +51,57 @@ module Ultragrep
         $stderr.puts("setting up state on '#{host}'")
         system_dbg("ssh", host, "mkdir -p ~/.ultragrep_remote/indexes") || raise("Couldn't make remote dir on #{host}!")
 
-        src_files = `git ls-files -- src`.split(/\s+/)
-
-        command = ["scp"]
-        command += src_files
-        command << host + ":.ultragrep_remote/"
-
-        system_dbg(*command) || raise("Couldn't scp source files to #{host}!")
-
-        system_dbg("ssh", host, "cd .ultragrep_remote && make") || raise("Couldn't build source on #{host}!")
+        binaries = static_binaries(remote_arch(host))
+        system_dbg("scp", *binaries, host + ":.ultragrep_remote/") || raise("Couldn't scp binaries to #{host}!")
 
         system_dbg("scp", @config.local_lua_path, host + ":.ultragrep_remote/") || raise("Coudln't scp #{@config.local_lua_path} to #{host}")
       end
+    end
+
+    DOCKER_PLATFORMS = {
+      "x86_64"  => "linux/amd64",
+      "amd64"   => "linux/amd64",
+      "aarch64" => "linux/arm64",
+      "arm64"   => "linux/arm64",
+    }
+
+    BINARIES = %w(ug_guts ug_cat)
+
+    def remote_arch(host)
+      arch = syscall("ssh", host, "uname -m") || raise("Couldn't determine architecture of #{host}!")
+      DOCKER_PLATFORMS[arch] || raise("Unsupported architecture '#{arch}' on #{host}")
+    end
+
+    # Builds static linux binaries in a docker image and copies them out of a
+    # throwaway container into build/<platform>/.  Done once per platform per run.
+    def static_binaries(platform)
+      @static_binaries ||= {}
+      @static_binaries[platform] ||= build_binaries(platform)
+    end
+
+    def build_binaries(platform)
+      root = File.join(File.dirname(__FILE__), "..", "..")
+
+      out_dir = File.join(Dir.mktmpdir, platform.tr("/", "-"))
+      FileUtils.mkdir_p(out_dir)
+
+      image = "ultragrep-static:#{platform.tr("/", "-")}"
+
+      $stderr.puts("building static binaries for #{platform}")
+      system_dbg("docker", "build", "--quiet", "--platform", platform, "-t", image,
+                  "-f", File.join(root, "docker", "linux-static.Dockerfile"), root, :out => File::NULL) ||
+        raise("Couldn't build docker image for #{platform} (is docker running?)")
+
+      container = syscall("docker", "create", "--platform", platform, image, "true") ||
+        raise("Couldn't create container from #{image}")
+
+      BINARIES.map do |bin|
+        dest = File.join(out_dir, bin)
+        system_dbg("docker", "cp", "#{container}:/out/#{bin}", dest) || raise("Couldn't copy #{bin} out of #{image}")
+        dest
+      end
+    ensure
+      system_dbg("docker", "rm", container, :out => File::NULL) if container
     end
 
     def collect_files
